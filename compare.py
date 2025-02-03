@@ -3,11 +3,109 @@ import math
 import pandas as pd
 from typing import List, Dict, Union
 from pydantic import BaseModel
-from openai import OpenAI
+from openai import AzureOpenAI
 from dotenv import load_dotenv
 import streamlit as st
 import logging  # ログ機能の追加
 from datetime import datetime  # datetimeモジュールを追加
+import PyPDF2  # PDFファイル用ライブラリ
+import docx     # Wordファイル用ライブラリ
+import io       # ファイルオブジェクトを扱うため
+
+def read_file_with_encoding(file_content: bytes) -> str:
+    """
+    複数のエンコーディングを試してファイルを読み込む関数
+    """
+    encodings = ['utf-8', 'shift_jis', 'cp932', 'euc_jp']
+    
+    for encoding in encodings:
+        try:
+            text = file_content.decode(encoding)
+            if text.strip():  # 空でない場合のみ成功とみなす
+                logging.info(f"{encoding}でのデコードに成功しました。")
+                return text
+            logging.warning(f"{encoding}でデコードは成功しましたが、テキストが空です。")
+        except UnicodeDecodeError:
+            logging.warning(f"{encoding}でのデコードに失敗しました。")
+            continue
+    
+    raise ValueError("すべてのエンコーディングでデコードに失敗しました。")
+
+def read_file_content(uploaded_file) -> bytes:
+    """
+    アップロードされたファイルの内容を読み込む関数
+    """
+    try:
+        # ファイルポインタを先頭に戻す
+        uploaded_file.seek(0)
+        content = uploaded_file.getvalue()  # read()の代わりにgetvalue()を使用
+        return content
+    except Exception as e:
+        logging.error(f"ファイル読み込みエラー: {e}")
+        raise
+
+def read_word_chunks(uploaded_file) -> List[str]:
+    """
+    Wordファイルからテキストを抽出し、段落ごとにチャンク化する関数。
+    """
+    text_chunks = []
+    try:
+        content = read_file_content(uploaded_file)
+        doc_buffer = io.BytesIO(content)
+        doc = docx.Document(doc_buffer)
+        
+        # テーブルのテキストも抽出
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    if cell.text.strip():
+                        text_chunks.append(cell.text.strip())
+        
+        # 段落のテキストを抽出
+        for paragraph in doc.paragraphs:
+            if paragraph.text.strip():  # 空の段落を除外
+                text_chunks.append(paragraph.text)
+        
+        # 空のチャンクリストをチェック
+        if not text_chunks:
+            logging.warning("Wordファイルから抽出されたテキストが空です。")
+            return []
+            
+        return text_chunks
+    except Exception as e:
+        logging.error(f"Wordファイル読み込みエラー: {e}")
+        st.error(f"Wordファイルの読み込みに失敗しました: {e}")
+        return []
+
+def read_pdf_chunks(uploaded_file) -> List[str]:
+    """
+    PDFファイルからテキストを抽出し、ページごとにチャンク化する関数。
+    """
+    text_chunks = []
+    try:
+        content = read_file_content(uploaded_file)
+        pdf_buffer = io.BytesIO(content)
+        pdf_reader = PyPDF2.PdfReader(pdf_buffer)
+        
+        for page in pdf_reader.pages:
+            text = page.extract_text()
+            if text.strip():  # 空のページを除外
+                # 長い文章を適切な長さで分割
+                paragraphs = text.split('\n\n')
+                for paragraph in paragraphs:
+                    if paragraph.strip():
+                        text_chunks.append(paragraph.strip())
+        
+        # 空のチャンクリストをチェック
+        if not text_chunks:
+            logging.warning("PDFファイルから抽出されたテキストが空です。")
+            return []
+            
+        return text_chunks
+    except Exception as e:
+        logging.error(f"PDFファイル読み込みエラー: {e}")
+        st.error(f"PDFファイルの読み込みに失敗しました: {e}")
+        return []
 
 # .envファイルから環境変数を読み込む
 load_dotenv()
@@ -21,14 +119,17 @@ logging.basicConfig(
 )
 logging.getLogger('dotenv').setLevel(logging.WARNING)  # dotenvのログレベルを下げる
 
-# OpenAIクライアントの初期化 (APIキーは環境変数から自動で読み込まれる)
-client = OpenAI()
+# Azure OpenAIクライアントの初期化
+client = AzureOpenAI(
+    api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+    api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
+    azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT")
+)
 
-# Embedding用モデルの指定
-EMBEDDING_MODEL = "text-embedding-3-large"
-
-# 差分要約に使うチャットモデル
-CHAT_MODEL = "gpt-4o"
+# Embedding用モデルのデプロイメント名
+EMBEDDING_DEPLOYMENT = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT")
+# 差分要約に使うチャットモデルのデプロイメント名
+CHAT_DEPLOYMENT = os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT")
 
 # Pydanticモデル：GPT-4oの応答を構造化する
 class CompareOutput(BaseModel):
@@ -40,10 +141,9 @@ def get_embedding(text: str) -> List[float]:
     テキストを Embedding ベクトルに変換する関数。
     """
     response = client.embeddings.create(
-        model=EMBEDDING_MODEL,
+        model=EMBEDDING_DEPLOYMENT,
         input=text
     )
-    # OpenAI pythonパッケージの形式に合わせて取得
     embedding = response.data[0].embedding
     return embedding
 
@@ -70,20 +170,25 @@ def compare_texts_with_gpt4o(base_text: str, compare_texts: Union[str, List[str]
             "role": "system",
             "content": (
                 "あなたは法務の専門家アシスタントです。"
-                "出力はJSON形式で、is_similarとdifference_summaryの2項目を返してください。"
+                "出力はJSON形式で、is_similarとdifference_summaryの2項目を必ず返してください。"
                 "これから提示する【本社規定項目】と【子会社規定】を比較し、"
                 "子会社規定が本社規定の内容を実質的に満たしているか判断してください。"
                 "もし内容が実質的に同じ(本社規定を満たしている)と判断できる場合はis_similar=Trueにしてください。"
                 "一部でも本社規定を満たしていない場合はis_similar=Falseとしてください。"
-                "本社規定にない内容が子会社規定にあっても、無視してください。"
-                "子会社規定は複数のチャンクに分割されている可能性があります。すべてのチャンクを考慮して判断してください。" # 複数チャンク対応指示
+                "重要な注意点として、子会社規定にのみ存在する記述（例えば、適用範囲の詳細など）は、本社規定の充足性判断には不要です。"
+                "これらの子会社規定にしかない情報は、差分サマリに含めないでください。"
+                "比較対象は、本社規定の項目が子会社規定に実質的に含まれているかどうかのみです。"
+                "子会社規定が本社規定の意図を汲み、同等の内容を別の表現で記述している場合でも、類似していると判断してください。"
+                "子会社規定は複数のチャンクに分割されている可能性があります。すべてのチャンクを考慮して、全体として本社規定を満たしているか判断してください。" # 複数チャンク対応指示
+                "差分サマリは、本社規定を満たしていない部分のみを具体的に記述してください。"
+                "もし差分がない場合は、difference_summaryは空にしてください。"
             )
         },
         {
             "role": "user",
             "content": (
                 "以下の【本社規定項目】の内容を【子会社規定】が満たしているか比較してください。\n"
-                "【子会社規定】は複数のテキストチャンクで構成されている場合があります。\n" # 複数チャンクの説明を追加
+                "【子会社規定】は複数のテキストチャンクで構成されている場合があります。\n"
                 "すべてのチャンクを考慮して、全体として本社規定を満たしているか判断してください。\n" # 判断基準を明確化
                 "もし文面が違う場合は、その違いを差分サマリとして簡潔に教えてください。\n"
                 "出力はJSON形式で日本語で返してください。\n\n"
@@ -96,7 +201,7 @@ def compare_texts_with_gpt4o(base_text: str, compare_texts: Union[str, List[str]
     ]
 
     completion = client.beta.chat.completions.parse(
-        model=CHAT_MODEL,
+        model=CHAT_DEPLOYMENT,
         messages=messages,
         response_format=CompareOutput,
     )
@@ -204,63 +309,200 @@ def generate_markdown_report(
     logging.info("レポート生成完了")
     return "\n".join(md_report)
 
+def generate_checklist_from_document(document_text: str) -> List[Dict[str, str]]:
+    """
+    本社規定文書からチェックリスト項目を生成する関数
+    """
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "あなたは法務の専門家アシスタントです。"
+                "提供された規定文書から、重要な規定項目をチェックリスト形式で抽出してください。"
+                "各項目は簡潔で明確な文章にしてください。"
+                "出力は1行1項目の形式で、各項目は規定の重要な要件を表現するものとしてください。"
+            )
+        },
+        {
+            "role": "user",
+            "content": (
+                "以下の規定文書から、重要な規定項目をチェックリスト形式で抽出してください。\n\n"
+                f"{document_text}"
+            )
+        }
+    ]
+
+    completion = client.chat.completions.create(
+        model=CHAT_DEPLOYMENT,
+        messages=messages,
+        temperature=0
+    )
+    
+    # 応答から項目を抽出してリスト形式に変換
+    checklist_items = completion.choices[0].message.content.strip().split('\n')
+    return [{"id": f"A-{i+1}", "text": item.strip()} for i, item in enumerate(checklist_items) if item.strip()]
+
 # Streamlit アプリケーション構築
 st.title("規定比較ツール")
 
-st.header("1. 本社規定チェックリスト")
-checklist_text = st.text_area(
-    "本社規定のチェックリスト項目を1行ずつ入力してください。",
-    """この規程は、会社の目的および基本方針を定めるものである。
-適用範囲は全従業員とし、正社員および契約社員を含む。""",
-    height=200
-)
-example_checklist = [
-    {"id": f"1-{i+1}", "text": item.strip()}
-    for i, item in enumerate(checklist_text.split('\n')) if item.strip()
-]
+# チェックリストを初期化
+example_checklist = []
+
+st.header("1. 本社規定")
+# 本社規定のファイルアップロード
+parent_uploaded_file = st.file_uploader("本社規定のファイルをアップロードしてください (PDF, Word)", type=["pdf", "docx"], key="parent_file")
 
 st.header("2. 子会社規定チャンク")
-subsidiary_chunks_text = st.text_area(
-    "子会社規定のテキストチャンクを1行ずつ入力してください。",
+# ファイルアップローダーを配置
+uploaded_file = st.file_uploader("子会社規定のファイルをアップロードしてください (PDF, Word)", type=["pdf", "docx"])
+subsidiary_chunks_text = st.text_area( # テキストエリアは削除せず、ファイルアップロードがない場合の代替として残す
+    "または、子会社規定のテキストチャンクを1行ずつ入力してください。",
     """当社の目的および基本方針は、企業価値の最大化と従業員の幸福を実現することにある。
 この規程は、取締役および正社員に適用される。派遣社員は対象外とする。""",
-    height=200
+    height=200,
+    disabled=uploaded_file is not None # ファイルがアップロードされたらテキストエリアを非活性化
 )
-example_subsidiary_chunks = [
-    {"id": f"C-{i+1}", "text": item.strip()}
-    for i, item in enumerate(subsidiary_chunks_text.split('\n')) if item.strip()
-]
+example_subsidiary_chunks = [] # 初期化処理はbuttonクリック時に移動
 
 st.sidebar.header("パラメータ設定")
 top_k = st.sidebar.number_input("Top K", min_value=1, max_value=10, value=3)
 similarity_threshold = st.sidebar.slider("類似度閾値", 0.0, 1.0, 0.5, step=0.1)
 
 if st.button("比較実行"):
-    if not example_checklist or not example_subsidiary_chunks:
-        st.error("チェックリストと子会社規定チャンクの両方を入力してください。")
+    logging.debug(f"【デバッグログ】比較実行ボタン押下時 example_checklist: {example_checklist}")
+    
+    # 本社規定ファイルの処理
+    if parent_uploaded_file is not None:
+        try:
+            file_extension = parent_uploaded_file.name.split('.')[-1].lower()
+            parent_text = ""
+            
+            try:
+                if file_extension == "pdf":
+                    chunks = read_pdf_chunks(parent_uploaded_file)
+                    if chunks:
+                        parent_text = "\n\n".join(chunks)
+                        logging.debug(f"PDFから抽出されたテキストの長さ: {len(parent_text)}")
+                elif file_extension == "docx":
+                    chunks = read_word_chunks(parent_uploaded_file)
+                    if chunks:
+                        parent_text = "\n\n".join(chunks)
+                        logging.debug(f"Wordから抽出されたテキストの長さ: {len(parent_text)}")
+                else:
+                    # テキストファイルとして読み込み
+                    content = read_file_content(parent_uploaded_file)
+                    parent_text = read_file_with_encoding(content)
+                    logging.debug(f"テキストファイルから読み込まれたテキストの長さ: {len(parent_text)}")
+            except Exception as e:
+                logging.error(f"ファイル読み込みエラー: {e}")
+                st.error(f"ファイルの読み込みに失敗しました: {str(e)}")
+                parent_text = ""
+            
+            if not parent_text.strip():
+                st.error("本社規定ファイルの内容が空です。ファイルを確認してください。")
+                logging.error("本社規定ファイルの内容が空です。")
+            else:
+                logging.info(f"抽出されたテキストのサンプル（先頭100文字）: {parent_text[:100]}")
+                # チェックリストの生成
+                example_checklist = generate_checklist_from_document(parent_text)
+                if not example_checklist:
+                    st.error("本社規定からチェックリストを生成できませんでした。")
+                    logging.error("チェックリストの生成に失敗しました。")
+                else:
+                    st.success("チェックリストを生成しました！")
+                    for item in example_checklist:
+                        st.write(f"{item['id']}: {item['text']}")
+                
+        except Exception as e:
+            st.error(f"本社規定ファイルの処理に失敗しました: {str(e)}")
+            logging.error(f"本社規定ファイル処理エラー: {e}")
+    
+    # 子会社規定の処理
+    if not example_checklist:
+        st.error("チェックリストを入力してください。")
+    elif not uploaded_file and not subsidiary_chunks_text:
+        st.error("子会社規定ファイルまたはテキストを入力してください。")
     else:
         with st.spinner("比較レポート作成中..."):
-            report_md = generate_markdown_report(
-                checklist=example_checklist,
-                subsidiary_chunks=example_subsidiary_chunks,
-                top_k=top_k,
-                similarity_threshold=similarity_threshold
-            )
-        st.header("比較レポート")
-        st.markdown(report_md)
-        st.success("比較レポートが完成しました！")
+            example_subsidiary_chunks = []
+            if uploaded_file is not None:
+                file_extension = uploaded_file.name.split('.')[-1].lower()
+                if file_extension == "pdf":
+                    chunks_text = read_pdf_chunks(uploaded_file)
+                elif file_extension == "docx":
+                    chunks_text = read_word_chunks(uploaded_file)
+                else:
+                    st.error("PDFまたはWordファイルをアップロードしてください。")
+                    chunks_text = []
+                example_subsidiary_chunks = [
+                    {"id": f"F-{i+1}", "text": item.strip()}
+                    for i, item in enumerate(chunks_text) if item.strip()
+                ]
+            elif subsidiary_chunks_text:
+                example_subsidiary_chunks = [
+                    {"id": f"C-{i+1}", "text": item.strip()}
+                    for i, item in enumerate(subsidiary_chunks_text.split('\n')) if item.strip()
+                ]
 
-        # resultフォルダを作成（存在しない場合）
-        os.makedirs("result", exist_ok=True)
+            if example_subsidiary_chunks:
+                report_md = generate_markdown_report(
+                    checklist=example_checklist,
+                    subsidiary_chunks=example_subsidiary_chunks,
+                    top_k=top_k,
+                    similarity_threshold=similarity_threshold
+                )
+                st.header("比較レポート")
+                st.markdown(report_md)
+                st.success("比較レポートが完成しました！")
 
-        # 現在日時をファイル名に含める
-        now = datetime.now().strftime("%Y%m%d_%H%M%S")
-        file_name = f"result/compare_report_{now}.md"
+                # resultフォルダを作成（存在しない場合）
+                os.makedirs("result", exist_ok=True)
 
-        # レポートをファイルに保存
-        with open(file_name, "w", encoding="utf-8") as f:
-            f.write(report_md)
-        st.info(f"レポートを {file_name} に保存しました。") # 保存完了メッセージ
+                # 現在日時をファイル名に含める
+                now = datetime.now().strftime("%Y%m%d_%H%M%S")
+                file_name = f"result/compare_report_{now}.md"
+
+                # レポートをファイルに保存
+                with open(file_name, "w", encoding="utf-8") as f:
+                    f.write(report_md)
+                st.info(f"レポートを {file_name} に保存しました。")
+            else:
+                st.error("子会社規定の処理に失敗しました。ファイルを確認してください。")
 
 if __name__ == "__main__":
-    pass
+    if parent_uploaded_file is not None:
+        logging.debug(f"【デバッグログ】parent_uploaded_file が None ではないと評価されました。parent_uploaded_file の種類: {type(parent_uploaded_file).__name__}")
+        try:
+            parent_text = parent_uploaded_file.read().decode('utf-8')
+        except UnicodeDecodeError:
+            logging.warning("UTF-8でのデコードに失敗しました。Shift_JISでのデコードを試みます。")
+            try:
+                parent_text = parent_uploaded_file.read().decode('shift_jis')
+            except UnicodeDecodeError:
+                logging.error("Shift_JISでのデコードにも失敗しました。")
+                st.error("ファイルのデコードに失敗しました。UTF-8またはShift_JISでエンコードされたファイルをお試しください。")
+                parent_text = "" # デコード失敗時は空文字を代入
+            else:
+                logging.info("Shift_JISでのデコードに成功しました。")
+        st.write(parent_text)
+        if parent_text.strip():
+            logging.debug(f"【デバッグログ】parent_text.strip() が True と評価されました。parent_textの先頭50文字: {parent_text[:50]}")
+            logging.debug(f"【デバッグログ】parent_text 全体の長さ: {len(parent_text)}")
+
+            # チェックリスト生成処理 (generate_checklist_from_document) はこのブロック内で実行されます
+
+            if parent_uploaded_file is not None: # ファイルがアップロードされたら自動生成
+                with st.spinner("チェックリストを生成中..."):
+                    logging.debug(f"【デバッグログ】チェックリスト生成開始")
+                    example_checklist = generate_checklist_from_document(parent_text)  # ここで generate_checklist_from_document を呼び出し
+                    st.success("チェックリストを生成しました！")
+                    st.write(f"【デバッグ】チェックリスト生成後のexample_checklist: {example_checklist}")
+                    logging.debug(f"【デバッグログ】チェックリスト生成後のexample_checklist: {example_checklist}")
+                    logging.debug(f"【デバッグログ】チェックリスト生成完了")
+                    # 生成されたチェックリストを表示
+                    for item in example_checklist:
+                        st.write(f"{item['id']}: {item['text']}")
+        else:
+            logging.debug(f"【デバッグログ】parent_text.strip() が False と評価されました。parent_textの先頭50文字: {parent_text[:50]}")
+            logging.debug(f"【デバッグログ】parent_text 全体の長さ: {len(parent_text)}")
+            # st.error("ファイルからテキストを抽出できませんでした。")
