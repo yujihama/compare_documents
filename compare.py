@@ -3,7 +3,7 @@ import math
 import pandas as pd
 from typing import List, Dict, Union
 from pydantic import BaseModel
-from openai import AzureOpenAI
+from openai import AzureOpenAI, OpenAI
 from dotenv import load_dotenv
 import streamlit as st
 import logging  # ログ機能の追加
@@ -119,17 +119,24 @@ logging.basicConfig(
 )
 logging.getLogger('dotenv').setLevel(logging.WARNING)  # dotenvのログレベルを下げる
 
-# Azure OpenAIクライアントの初期化
-client = AzureOpenAI(
-    api_key=os.getenv("AZURE_OPENAI_API_KEY"),
-    api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
-    azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT")
-)
-
-# Embedding用モデルのデプロイメント名
-EMBEDDING_DEPLOYMENT = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT")
-# 差分要約に使うチャットモデルのデプロイメント名
-CHAT_DEPLOYMENT = os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT")
+# API設定の取得
+API_TYPE = os.getenv("API_TYPE", "azure")  # デフォルトはazure
+if API_TYPE.lower() == "azure":
+    client = AzureOpenAI(
+        api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+        api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
+        azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT")
+    )
+    # Azure OpenAIのモデルデプロイメント名
+    EMBEDDING_MODEL = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT")
+    CHAT_MODEL = os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT")
+else:
+    client = OpenAI(
+        api_key=os.getenv("OPENAI_API_KEY")
+    )
+    # OpenAIのモデル名
+    EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+    CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4-turbo-preview")
 
 # Pydanticモデル：GPT-4oの応答を構造化する
 class CompareOutput(BaseModel):
@@ -140,10 +147,16 @@ def get_embedding(text: str) -> List[float]:
     """
     テキストを Embedding ベクトルに変換する関数。
     """
-    response = client.embeddings.create(
-        model=EMBEDDING_DEPLOYMENT,
-        input=text
-    )
+    if API_TYPE.lower() == "azure":
+        response = client.embeddings.create(
+            model=EMBEDDING_MODEL,
+            input=text
+        )
+    else:
+        response = client.embeddings.create(
+            model=EMBEDDING_MODEL,
+            input=text
+        )
     embedding = response.data[0].embedding
     return embedding
 
@@ -179,7 +192,7 @@ def compare_texts_with_gpt4o(base_text: str, compare_texts: Union[str, List[str]
                 "これらの子会社規定にしかない情報は、差分サマリに含めないでください。"
                 "比較対象は、本社規定の項目が子会社規定に実質的に含まれているかどうかのみです。"
                 "子会社規定が本社規定の意図を汲み、同等の内容を別の表現で記述している場合でも、類似していると判断してください。"
-                "子会社規定は複数のチャンクに分割されている可能性があります。すべてのチャンクを考慮して、全体として本社規定を満たしているか判断してください。" # 複数チャンク対応指示
+                "子会社規定は複数のチャンクに分割されている可能性があります。すべてのチャンクを考慮して、全体として本社規定を満たしているか判断してください。"
                 "差分サマリは、本社規定を満たしていない部分のみを具体的に記述してください。"
                 "もし差分がない場合は、difference_summaryは空にしてください。"
             )
@@ -189,19 +202,19 @@ def compare_texts_with_gpt4o(base_text: str, compare_texts: Union[str, List[str]
             "content": (
                 "以下の【本社規定項目】の内容を【子会社規定】が満たしているか比較してください。\n"
                 "【子会社規定】は複数のテキストチャンクで構成されている場合があります。\n"
-                "すべてのチャンクを考慮して、全体として本社規定を満たしているか判断してください。\n" # 判断基準を明確化
+                "すべてのチャンクを考慮して、全体として本社規定を満たしているか判断してください。\n"
                 "もし文面が違う場合は、その違いを差分サマリとして簡潔に教えてください。\n"
                 "出力はJSON形式で日本語で返してください。\n\n"
                 "【本社規定項目】\n"
                 f"{base_text}\n\n"
                 "【子会社規定】\n"
-                f"{chr(10).join(compare_texts) if isinstance(compare_texts, list) else compare_texts}\n" # 複数チャンクを改行で連結
+                f"{chr(10).join(compare_texts) if isinstance(compare_texts, list) else compare_texts}\n"
             )
         }
     ]
 
     completion = client.beta.chat.completions.parse(
-        model=CHAT_DEPLOYMENT,
+        model=CHAT_MODEL,
         messages=messages,
         response_format=CompareOutput,
     )
@@ -291,9 +304,9 @@ def generate_markdown_report(
         md_report.append(f"**本社規定項目テキスト**: {item_text}\n")
 
         if found_fulfilled:
-            md_report.append("- **この項目は子会社規定で満たされています。**")
+            md_report.append("- <span style='color: green; font-weight: bold'>この項目は子会社規定で満たされています。</span>")
         else:
-            md_report.append("- **この項目は子会社規定で不十分と判定されました。**")
+            md_report.append("- <span style='color: red; font-weight: bold'>この項目は子会社規定で不十分と判定されました。</span>")
 
         # 関連チャンクの比較結果一覧を表示
         md_report.append("#### 関連チャンクの判定結果 (閾値以上)")
@@ -333,7 +346,7 @@ def generate_checklist_from_document(document_text: str) -> List[Dict[str, str]]
     ]
 
     completion = client.chat.completions.create(
-        model=CHAT_DEPLOYMENT,
+        model=CHAT_MODEL,
         messages=messages,
         temperature=0
     )
@@ -341,6 +354,24 @@ def generate_checklist_from_document(document_text: str) -> List[Dict[str, str]]
     # 応答から項目を抽出してリスト形式に変換
     checklist_items = completion.choices[0].message.content.strip().split('\n')
     return [{"id": f"A-{i+1}", "text": item.strip()} for i, item in enumerate(checklist_items) if item.strip()]
+
+def merge_checklists(checklists: List[List[Dict[str, str]]]) -> List[Dict[str, str]]:
+    """
+    複数のチェックリストを1つに統合する関数
+    重複を除去し、IDを振り直します
+    """
+    # 全てのチェックリストアイテムのテキストを集める
+    all_items = []
+    seen_texts = set()  # 重複チェック用
+    
+    for checklist in checklists:
+        for item in checklist:
+            if item["text"] not in seen_texts:
+                all_items.append(item["text"])
+                seen_texts.add(item["text"])
+    
+    # 新しいIDを振り直してチェックリストを作成
+    return [{"id": f"A-{i+1}", "text": text} for i, text in enumerate(all_items)]
 
 # Streamlit アプリケーション構築
 st.title("規定比較ツール")
@@ -355,14 +386,6 @@ parent_uploaded_file = st.file_uploader("本社規定のファイルをアップ
 st.header("2. 子会社規定チャンク")
 # ファイルアップローダーを配置
 uploaded_file = st.file_uploader("子会社規定のファイルをアップロードしてください (PDF, Word)", type=["pdf", "docx"])
-subsidiary_chunks_text = st.text_area( # テキストエリアは削除せず、ファイルアップロードがない場合の代替として残す
-    "または、子会社規定のテキストチャンクを1行ずつ入力してください。",
-    """当社の目的および基本方針は、企業価値の最大化と従業員の幸福を実現することにある。
-この規程は、取締役および正社員に適用される。派遣社員は対象外とする。""",
-    height=200,
-    disabled=uploaded_file is not None # ファイルがアップロードされたらテキストエリアを非活性化
-)
-example_subsidiary_chunks = [] # 初期化処理はbuttonクリック時に移動
 
 st.sidebar.header("パラメータ設定")
 top_k = st.sidebar.number_input("Top K", min_value=1, max_value=10, value=3)
@@ -375,53 +398,58 @@ if st.button("比較実行"):
     if parent_uploaded_file is not None:
         try:
             file_extension = parent_uploaded_file.name.split('.')[-1].lower()
-            parent_text = ""
+            parent_chunks = []
             
-            try:
-                if file_extension == "pdf":
-                    chunks = read_pdf_chunks(parent_uploaded_file)
-                    if chunks:
-                        parent_text = "\n\n".join(chunks)
-                        logging.debug(f"PDFから抽出されたテキストの長さ: {len(parent_text)}")
-                elif file_extension == "docx":
-                    chunks = read_word_chunks(parent_uploaded_file)
-                    if chunks:
-                        parent_text = "\n\n".join(chunks)
-                        logging.debug(f"Wordから抽出されたテキストの長さ: {len(parent_text)}")
-                else:
-                    # テキストファイルとして読み込み
-                    content = read_file_content(parent_uploaded_file)
-                    parent_text = read_file_with_encoding(content)
-                    logging.debug(f"テキストファイルから読み込まれたテキストの長さ: {len(parent_text)}")
-            except Exception as e:
-                logging.error(f"ファイル読み込みエラー: {e}")
-                st.error(f"ファイルの読み込みに失敗しました: {str(e)}")
-                parent_text = ""
+            if file_extension == "pdf":
+                parent_chunks = read_pdf_chunks(parent_uploaded_file)
+                if not parent_chunks:
+                    st.error("PDFからテキストを抽出できませんでした。")
+                    logging.error("PDFからのテキスト抽出に失敗")
+            elif file_extension == "docx":
+                parent_chunks = read_word_chunks(parent_uploaded_file)
+                if not parent_chunks:
+                    st.error("Wordファイルからテキストを抽出できませんでした。")
+                    logging.error("Wordからのテキスト抽出に失敗")
+            else:
+                # テキストファイルとして読み込み
+                content = read_file_content(parent_uploaded_file)
+                text = read_file_with_encoding(content)
+                # テキストファイルの場合も適度な長さでチャンク分割
+                parent_chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
             
-            if not parent_text.strip():
+            if not parent_chunks:
                 st.error("本社規定ファイルの内容が空です。ファイルを確認してください。")
                 logging.error("本社規定ファイルの内容が空です。")
             else:
-                logging.info(f"抽出されたテキストのサンプル（先頭100文字）: {parent_text[:100]}")
-                # チェックリストの生成
-                example_checklist = generate_checklist_from_document(parent_text)
-                if not example_checklist:
-                    st.error("本社規定からチェックリストを生成できませんでした。")
-                    logging.error("チェックリストの生成に失敗しました。")
-                else:
-                    st.success("チェックリストを生成しました！")
-                    for item in example_checklist:
-                        st.write(f"{item['id']}: {item['text']}")
-                
+                # 各チャンクに対してチェックリストを生成
+                with st.spinner("チェックリストを生成中..."):
+                    all_checklists = []
+                    for i, chunk in enumerate(parent_chunks):
+                        logging.info(f"チャンク {i+1}/{len(parent_chunks)} のチェックリスト生成中")
+                        chunk_checklist = generate_checklist_from_document(chunk)
+                        all_checklists.append(chunk_checklist)
+                    
+                    # 全チェックリストを統合
+                    example_checklist = merge_checklists(all_checklists)
+                    
+                    if not example_checklist:
+                        st.error("本社規定からチェックリストを生成できませんでした。")
+                        logging.error("チェックリストの生成に失敗しました。")
+                    else:
+                        st.success("チェックリストを生成しました！")
+                        with st.expander("チェックリストの内容を表示"):
+                            for item in example_checklist:
+                                st.write(f"{item['id']}: {item['text']}")
+        
         except Exception as e:
-            st.error(f"本社規定ファイルの処理に失敗しました: {str(e)}")
-            logging.error(f"本社規定ファイル処理エラー: {e}")
+            logging.error(f"ファイル読み込みエラー: {e}")
+            st.error(f"ファイルの読み込みに失敗しました: {str(e)}")
     
     # 子会社規定の処理
     if not example_checklist:
         st.error("チェックリストを入力してください。")
-    elif not uploaded_file and not subsidiary_chunks_text:
-        st.error("子会社規定ファイルまたはテキストを入力してください。")
+    elif not uploaded_file:
+        st.error("子会社規定ファイルをアップロードしてください。")
     else:
         with st.spinner("比較レポート作成中..."):
             example_subsidiary_chunks = []
@@ -438,11 +466,6 @@ if st.button("比較実行"):
                     {"id": f"F-{i+1}", "text": item.strip()}
                     for i, item in enumerate(chunks_text) if item.strip()
                 ]
-            elif subsidiary_chunks_text:
-                example_subsidiary_chunks = [
-                    {"id": f"C-{i+1}", "text": item.strip()}
-                    for i, item in enumerate(subsidiary_chunks_text.split('\n')) if item.strip()
-                ]
 
             if example_subsidiary_chunks:
                 report_md = generate_markdown_report(
@@ -452,7 +475,7 @@ if st.button("比較実行"):
                     similarity_threshold=similarity_threshold
                 )
                 st.header("比較レポート")
-                st.markdown(report_md)
+                st.markdown(report_md, unsafe_allow_html=True)
                 st.success("比較レポートが完成しました！")
 
                 # resultフォルダを作成（存在しない場合）
@@ -488,21 +511,6 @@ if __name__ == "__main__":
         if parent_text.strip():
             logging.debug(f"【デバッグログ】parent_text.strip() が True と評価されました。parent_textの先頭50文字: {parent_text[:50]}")
             logging.debug(f"【デバッグログ】parent_text 全体の長さ: {len(parent_text)}")
-
-            # チェックリスト生成処理 (generate_checklist_from_document) はこのブロック内で実行されます
-
-            if parent_uploaded_file is not None: # ファイルがアップロードされたら自動生成
-                with st.spinner("チェックリストを生成中..."):
-                    logging.debug(f"【デバッグログ】チェックリスト生成開始")
-                    example_checklist = generate_checklist_from_document(parent_text)  # ここで generate_checklist_from_document を呼び出し
-                    st.success("チェックリストを生成しました！")
-                    st.write(f"【デバッグ】チェックリスト生成後のexample_checklist: {example_checklist}")
-                    logging.debug(f"【デバッグログ】チェックリスト生成後のexample_checklist: {example_checklist}")
-                    logging.debug(f"【デバッグログ】チェックリスト生成完了")
-                    # 生成されたチェックリストを表示
-                    for item in example_checklist:
-                        st.write(f"{item['id']}: {item['text']}")
         else:
             logging.debug(f"【デバッグログ】parent_text.strip() が False と評価されました。parent_textの先頭50文字: {parent_text[:50]}")
             logging.debug(f"【デバッグログ】parent_text 全体の長さ: {len(parent_text)}")
-            # st.error("ファイルからテキストを抽出できませんでした。")
